@@ -9,40 +9,28 @@
 #include "drv_io.h"
 #include "stdio.h"
 #include "string.h"
-#include "xiaozhi2.h"
+#include "xiaozhi_websocket.h"
 #include "./iot/iot_c_api.h"
 #ifdef BSP_USING_PM
     #include "gui_app_pm.h"
 #endif // BSP_USING_PM
-#include "xiaozhi_public.h"
+#include "xiaozhi_client_public.h"
 #include "bf0_pm.h"
 #include <drivers/rt_drv_encoder.h>
 #include "drv_flash.h"
-#include "xiaozhi_weather.h"
+#include "../weather/weather.h"
 #include "lv_timer.h"
 #include "lv_display.h"
-extern void xiaozhi_ui_update_ble(char *string);
-extern void xiaozhi_ui_update_emoji(char *string);
-extern void xiaozhi_ui_chat_status(char *string);
-extern void xiaozhi_ui_chat_output(char *string);
-extern void xiaozhi_ui_standby_chat_output(char *string);
-extern void ui_swith_to_standby_screen();
-extern void ui_swith_to_xiaozhi_screen();
-extern void xiaozhi_ui_task(void *args);
-extern void xiaozhi(int argc, char **argv);
-extern void xiaozhi2(int argc, char **argv);
-extern void reconnect_xiaozhi();
-extern void xz_button_init(void);
-extern void xz_ws_audio_init();
-extern rt_tick_t last_listen_tick;
-extern xiaozhi_ws_t g_xz_ws;
-extern rt_mailbox_t g_button_event_mb;
-extern void ui_sleep_callback(lv_timer_t *timer);
-extern lv_obj_t *standby_screen;
-rt_mailbox_t g_battery_mb;
-extern lv_timer_t *ui_sleep_timer;
-extern lv_obj_t *shutdown_screen;
-extern lv_obj_t *sleep_screen;
+#include "../board/board_hardware.h"
+#include "xiaozhi_ui.h"
+#include "xiaozhi_mqtt.h"
+#include "xiaozhi_audio.h"
+#include "bts2_app_inc.h"
+#include "ble_connection_manager.h"
+#include "bt_connection_manager.h"
+#include "bt_env.h"
+#include "ulog.h"
+
 /* Common functions for RT-Thread based platform
  * -----------------------------------------------*/
 /**
@@ -50,22 +38,8 @@ extern lv_obj_t *sleep_screen;
  * @param  None
  * @retval None
  */
-void HAL_MspInit(void)
-{
-    //__asm("B .");        /*For debugging purpose*/
-    BSP_IO_Init();
-#ifdef BSP_USING_BOARD_SF32LB52_XTY_AI
-    HAL_PIN_Set(PAD_PA38, GPTIM1_CH1, PIN_PULLUP, 1);
-    HAL_PIN_Set(PAD_PA40, GPTIM1_CH2, PIN_PULLUP, 1);
-#endif
-}
 /* User code start from here
  * --------------------------------------------------------*/
-#include "bts2_app_inc.h"
-#include "ble_connection_manager.h"
-#include "bt_connection_manager.h"
-#include "bt_env.h"
-#include "ulog.h"
 
 #define BT_APP_READY 0
 #define BT_APP_CONNECT_PAN 1
@@ -79,24 +53,34 @@ void HAL_MspInit(void)
 #define BT_APP_RECONNECT 10 // 重连
 #define UPDATE_REAL_WEATHER_AND_TIME 11
 #define PAN_TIMER_MS 3000
+#define MQTT_RECONNECT 12
+
+#define MAX_RECONNECT_ATTEMPTS 30  // 30次尝试，每次1秒，共30秒
+#define XIAOZHI_UI_THREAD_STACK_SIZE (6144)
+#define BATTERY_THREAD_STACK_SIZE (2048)
+
+extern rt_tick_t last_listen_tick;
+extern xiaozhi_ws_t g_xz_ws;
+extern rt_mailbox_t g_button_event_mb;
+extern lv_obj_t *standby_screen;
+extern lv_timer_t *ui_sleep_timer;
+extern lv_obj_t *shutdown_screen;
+extern lv_obj_t *sleep_screen;
+
 
 bt_app_t g_bt_app_env;
 rt_mailbox_t g_bt_app_mb;
 BOOL g_pan_connected = FALSE;
 BOOL first_pan_connected = FALSE;
 int first_reconnect_attempts = 0;
+uint8_t Initiate_disconnection_flag = 0;//蓝牙主动断开标志
+rt_mailbox_t g_battery_mb;
 
 static rt_timer_t s_reconnect_timer = NULL;
 static rt_timer_t s_sleep_timer = NULL;
 static int reconnect_attempts = 0;
-#define MAX_RECONNECT_ATTEMPTS 30  // 30次尝试，每次1秒，共30秒
 static uint8_t g_sleep_enter_flag = 0;    // 进入睡眠标志位
-uint8_t Initiate_disconnection_flag = 0;//蓝牙主动断开标志
-
-
-
-#define XIAOZHI_UI_THREAD_STACK_SIZE (6144)
-#define BATTERY_THREAD_STACK_SIZE (2048)
+// UI线程和battery线程控制块
 static struct rt_thread xiaozhi_ui_thread;
 static struct rt_thread battery_thread;
 //ui线程
@@ -192,7 +176,12 @@ static void pulse_encoder_timeout_handle(void *parameter)
     }
 }
 #endif
-
+void HAL_MspInit(void)
+{
+    //__asm("B .");        /*For debugging purpose*/
+    BSP_IO_Init();
+    set_pinmux();
+}
 static void battery_level_task(void *parameter)
 {
     g_battery_mb = rt_mb_create("battery_level", 1, RT_IPC_FLAG_FIFO);
@@ -390,6 +379,14 @@ static int bt_app_interface_event_handle(uint16_t type, uint16_t event_id,
             rt_mb_send(g_bt_app_mb, BT_APP_READY);
         }
         break;
+        case BT_NOTIFY_COMMON_ACL_CONNECTED:
+        {
+            LOG_I("BT_NOTIFY_COMMON_ACL_CONNECTED\n");
+			// 清除蓝牙主动断开标志位
+            Initiate_disconnection_flag = 0;
+
+        }
+        break;
         case BT_NOTIFY_COMMON_ACL_DISCONNECTED:
         {
             bt_notify_device_base_info_t *info =
@@ -553,64 +550,6 @@ uint32_t bt_get_class_of_device()
            BT_PERIPHERAL_REMCONTROL;
 }
 
-static void check_poweron_reason(void)
-{
-    switch (SystemPowerOnModeGet())
-    {
-    case PM_REBOOT_BOOT:
-    case PM_COLD_BOOT:
-    {
-        // power on as normal
-        break;
-    }
-    case PM_HIBERNATE_BOOT:
-    case PM_SHUTDOWN_BOOT:
-    {
-        if (PMUC_WSR_RTC & pm_get_wakeup_src())
-        {
-            // RTC唤醒
-            NVIC_EnableIRQ(RTC_IRQn);
-            // power on as normal
-        }
-#ifdef BSP_USING_CHARGER
-        else if ((PMUC_WSR_PIN0 << (pm_get_charger_pin_wakeup())) & pm_get_wakeup_src())
-        {
-        }
-#endif
-        else if (PMUC_WSR_PIN_ALL & pm_get_wakeup_src())
-        {
-            rt_thread_mdelay(1000); // 延时1秒
-#ifdef BSP_USING_BOARD_SF32LB52_LCD_N16R8
-            int val = rt_pin_read(BSP_KEY1_PIN);
-#else
-            int val = rt_pin_read(BSP_KEY2_PIN);
-#endif
-            rt_kprintf("Power key level after 1s: %d\n", val);
-            if (val != KEY2_ACTIVE_LEVEL)
-            {
-                // 按键已松开，认为是误触发，直接关机
-                rt_kprintf("Not long press, shutdown now.\n");
-                PowerDownCustom();
-                while (1) {};
-            }
-            else
-            {
-                // 长按，正常开机
-                rt_kprintf("Long press detected, power on as normal.\n");
-            }
-        }
-        else if (0 == pm_get_wakeup_src())
-        {
-            RT_ASSERT(0);
-        }
-        break;
-    }
-    default:
-    {
-        RT_ASSERT(0);
-    }
-    }
-}
 static int32_t Write_MAC(int argc, char **argv)
 {
     uint8_t len;
@@ -661,22 +600,13 @@ int main(void)
     xz_set_lcd_brightness(LCD_BRIGHTNESS_DEFAULT);
     iot_initialize(); // Initialize iot
     xiaozhi_time_weather_init();// Initialize time and weather
+#ifdef XIAOZHI_USING_MQTT
+#else
     xz_ws_audio_init(); // 初始化音频
+    xz_ws_button_init2();//初始化关机键
 
-#ifdef BSP_USING_BOARD_SF32LB52_LCHSPI_ULP
-    unsigned int *addr2 = (unsigned int *)0x50003088; // 21
-    *addr2 = 0x00000200;
-    unsigned int *addr = (unsigned int *)0x500030B0; // 31
-    *addr = 0x00000200;
-
-    // senser
-    HAL_PIN_Set(PAD_PA30, GPIO_A30, PIN_PULLDOWN, 1);
-    BSP_GPIO_Set(30, 0, 1);
-    HAL_PIN_Set(PAD_PA39, GPIO_A39, PIN_PULLDOWN, 1);
-    HAL_PIN_Set(PAD_PA40, GPIO_A40, PIN_PULLDOWN, 1);
-
-    // rt_pm_request(PM_SLEEP_MODE_IDLE);
 #endif
+    set_pinmux();
     // Create  xiaozhi UI
     rt_err_t result = rt_thread_init(&xiaozhi_ui_thread,
                                      "xz_ui",
@@ -779,13 +709,13 @@ int main(void)
         else if (value == BT_APP_CONNECT_PAN_SUCCESS)
         {
             rt_kputs("BT_APP_CONNECT_PAN_SUCCESS\r\n");
+            
             //xiaozhi_ui_chat_output("初始化 请稍等...");
             xiaozhi_ui_standby_chat_output("初始化 请稍等...");
             xiaozhi_ui_update_ble("open");
             xiaozhi_ui_chat_status("初始化...");
             xiaozhi_ui_update_emoji("neutral");
-            // 清除主动断开标志位
-            Initiate_disconnection_flag = 0;
+
             rt_thread_mdelay(2000);
             // 执行NTP与天气同步
             xiaozhi_time_weather();
@@ -793,10 +723,10 @@ int main(void)
             xiaozhi_ui_standby_chat_output("请按键连接小智...");
 
 #ifdef XIAOZHI_USING_MQTT
-            xiaozhi(0, NULL);
-            rt_kprintf("Select MQTT Version\n");
+            xiaozhi(0,NULL);
+            //xz_mqtt_button_init();
 #else
-            xz_button_init();
+            xz_ws_button_init();
             // xiaozhi2(0, NULL); // Start Xiaozhi
 #endif
             // 在蓝牙和PAN连接成功后创建睡眠定时器
@@ -818,9 +748,6 @@ int main(void)
         {
 
                         xiaozhi2(0,NULL); // 重连小智websocket
-        
-                
-
        } 
         else if(value == BT_APP_PHONE_DISCONNECTED)
         {

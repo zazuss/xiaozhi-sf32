@@ -11,7 +11,7 @@
 #include "lwip/apps/mqtt.h"
 #include "lwip/udp.h"
 #include "lwip/tcpip.h"
-#include "xiaozhi.h"
+#include "xiaozhi_mqtt.h"
 #include "bf0_hal.h"
 #include "button.h"
 #include "os_adaptor.h"
@@ -21,7 +21,6 @@
 #include "audio_server.h"
 #include "drv_audprc.h"
 #include "mem_section.h"
-
 #ifdef PKG_XIAOZHI_USING_AEC
     #include "webrtc/common_audio/vad/include/webrtc_vad.h"
     #include "sifli_resample.h"
@@ -30,22 +29,29 @@
 #include "ble_connection_manager.h"
 #include "bt_connection_manager.h"
 #include "bt_env.h"
-#include "xiaozhi_public.h"
+#include "xiaozhi_client_public.h"
 #include "opus.h"
 #include "debug.h"
 #include "opus_private.h"
+#include "../weather/weather.h"
+#include "gui_app_pm.h"
+#include "lv_display.h"
+#include "xiaozhi_ui.h"
+#include "xiaozhi_websocket.h"
+#include "xiaozhi_audio.h"
+#include "log.h"
+
 #undef LOG_TAG
 #define LOG_TAG "xz"
 #define DBG_TAG "xz"
 #define DBG_LVL LOG_LVL_INFO
-#include "log.h"
-
 #define XZ_THREAD_NAME "xiaozhi"
 #define XZ_OPUS_STACK_SIZE (32 * 1024)
 #define XZ_EVENT_MIC_RX (1 << 0)
 #define XZ_EVENT_SPK_TX (1 << 1)
 #define XZ_EVENT_DOWNLINK (1 << 2)
 #define XZ_EVENT_EXIT (1 << 3)
+#define MQTT_RECONNECT 12
 
 #define XZ_EVENT_ALL                                                           \
     (XZ_EVENT_MIC_RX | XZ_EVENT_SPK_TX | XZ_EVENT_DOWNLINK | XZ_EVENT_EXIT)
@@ -59,9 +65,20 @@
 
 #define XZ_AUDIO_VERSION            "xz_audio_verson: 1.0"
 
+#ifdef XIAOZHI_USING_MQTT
+    #define XZ_DEVICE_STATE mqtt_g_state
+#else
+    #define XZ_DEVICE_STATE web_g_state
+#endif
+extern rt_mailbox_t g_bt_app_mb;
+extern uint8_t vad_enable;
+extern uint8_t Initiate_disconnection_flag;
+extern lv_obj_t *main_container;
+extern lv_obj_t *standby_screen;
 
 struct udp_pcb *udp_pcb;
 xz_audio_t xz_audio;
+bool g_ota_verified = true;
 
 #if defined(__CC_ARM) || defined(__CLANG_ARM)
 L2_RET_BSS_SECT_BEGIN(g_xz_opus_stack) //6000地址
@@ -73,17 +90,13 @@ static uint32_t
 #endif
 
 static void xz_opus_thread_entry(void *p);
-void xz_speaker_open(xz_audio_t *thiz);
-void xz_speaker_close(xz_audio_t *thiz);
+static void audio_write_and_wait(xz_audio_t *thiz, uint8_t *data, uint32_t data_len);
+static void xz_button_event_handler(int32_t pin, button_action_t action);
 void xz_mic_open(xz_audio_t *thiz);
 void xz_mic_close(xz_audio_t *thiz);
-static void audio_write_and_wait(xz_audio_t *thiz, uint8_t *data,
-                                 uint32_t data_len);
+void xz_speaker_close(xz_audio_t *thiz);
+void xz_speaker_open(xz_audio_t *thiz);
 
-extern void xiaozhi_ui_chat_status(char *string);
-extern void xz_audio_send_using_websocket(uint8_t *data,
-                                          int len); // 发送音频数据
-extern uint8_t vad_enable;
 void xz_audio_send(uint8_t *data, int len)
 {
     uint32_t nonce[4];
@@ -161,8 +174,27 @@ void xz_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
         rt_kprintf("invalid udp\n");
     }
 }
-
-#if PKG_XIAOZHI_USING_AEC
+#ifdef XIAOZHI_USING_MQT
+void simulate_button_pressed()
+{
+     rt_kprintf("mqtt simulate_button_pressed pressed\r\n");
+    if(Initiate_disconnection_flag)//蓝牙主动断开不允许mic触发
+    {
+        rt_kprintf("Initiate_disconnection_flag\r\n");
+        return;
+    }
+    xz_button_event_handler(BSP_KEY1_PIN, BUTTON_PRESSED);
+}
+void simulate_button_released()
+{
+    rt_kprintf("mqtt simulate_button_released released\r\n");
+    if(Initiate_disconnection_flag)
+    {
+        return;
+    }
+    xz_button_event_handler(BSP_KEY1_PIN, BUTTON_RELEASED);
+}
+#else 
 RT_WEAK void simulate_button_pressed()
 {
 }
@@ -186,7 +218,7 @@ static int mic_callback(audio_server_callback_cmt_t cmd,
         int ret = WebRtcVad_Process(thiz->handle, 16000, (int16_t *)p->data,p->data_len / 2); //检测是否是人声 返回1是人声
         if(vad_enable) //如果开起了不打断功能 1是不打断
         { 
-            if (web_g_state != kDeviceStateIdle) 
+            if (XZ_DEVICE_STATE != kDeviceStateIdle) 
             {
                 return 0; // 非待命状态不处理VAD
             }
@@ -196,7 +228,7 @@ static int mic_callback(audio_server_callback_cmt_t cmd,
 #if !ALLOW_VAD_WHEN_SPEAKING
             if ((ret == 1))
 #else
-            if ((ret == 1) && (web_g_state != kDeviceStateSpeaking))
+            if ((ret == 1) && (XZ_DEVICE_STATE != kDeviceStateSpeaking))
 #endif
             {
                 LOG_I("idle --> wait speaking");
@@ -210,7 +242,7 @@ static int mic_callback(audio_server_callback_cmt_t cmd,
         {
             if(vad_enable) //如果开起了不打断功能 1是不打断   
             {         
-                if (web_g_state == kDeviceStateSpeaking)
+                if (XZ_DEVICE_STATE == kDeviceStateSpeaking)
                 {
                     // xiaozhi is speaking, do not respond to mic input
                     LOG_I("speaking --> idle");
@@ -333,6 +365,15 @@ void xz_speaker(int on)
 #ifdef XIAOZHI_USING_MQTT
 static void xz_button_event_handler(int32_t pin, button_action_t action)
 {
+    lv_display_trigger_activity(NULL);
+    gui_pm_fsm(GUI_PM_ACTION_WAKEUP); // 唤醒设备
+    rt_kprintf("in mqtt button handle2\n");
+    // 如果当前处于KWS模式，则退出KWS模式
+    if (g_kws_running) 
+    {  
+        rt_kprintf("KWS exit\n");
+        g_kws_force_exit = 1;
+    }
     static button_action_t last_action = BUTTON_RELEASED;
     rt_kprintf("button(%d) %d:", pin, action);
     if (last_action == action)
@@ -340,64 +381,46 @@ static void xz_button_event_handler(int32_t pin, button_action_t action)
         return;
     }
     last_action = action;
-    if (mqtt_g_state == kDeviceStateUnknown) // goodby唤醒
-    {
-        xiaozhi_ui_chat_status("唤醒中...");
-        mqtt_hello(&g_xz_context);
+
         if (action == BUTTON_PRESSED)
         {
+            
+            lv_obj_t *now_screen = lv_screen_active();
             rt_kprintf("pressed\r\n");
+            rt_kprintf("mqtt按键->对话\n");
+            if (now_screen == standby_screen)
+            {
+                ui_switch_to_xiaozhi_screen();
+            }
+            if (mqtt_g_state == kDeviceStateUnknown) // goodby唤醒
+            {
+                mqtt_hello(&g_xz_context);
+            }
             if (mqtt_g_state == kDeviceStateSpeaking)
             {
-                mqtt_speak_abort(&g_xz_context, kAbortReasonWakeWordDetected);
                 mqtt_g_state = kDeviceStateListening;
             }
-            mqtt_listen_start(&g_xz_context, kListeningModeManualStop);
+
             xiaozhi_ui_chat_status("聆听中...");
-            xz_mic(1);
         }
         else if (action == BUTTON_RELEASED)
         {
             rt_kprintf("released\r\n");
             xiaozhi_ui_chat_status("待命中...");
-            xz_mic(0);
-            mqtt_listen_stop(&g_xz_context);
         }
-    }
-    else
-    {
-        if (action == BUTTON_PRESSED)
-        {
-            rt_kprintf("pressed\r\n");
-            if (mqtt_g_state == kDeviceStateSpeaking)
-            {
-                mqtt_g_state = kDeviceStateListening;
-            }
-            mqtt_speak_abort(&g_xz_context, kAbortReasonWakeWordDetected);
-            mqtt_listen_start(&g_xz_context, kListeningModeManualStop);
-            xiaozhi_ui_chat_status("聆听中...");
-            xz_mic(1);
-        }
-        else if (action == BUTTON_RELEASED)
-        {
-            rt_kprintf("released\r\n");
-            xiaozhi_ui_chat_status("待命中...");
-            xz_mic(0);
-            mqtt_listen_stop(&g_xz_context);
-        }
-    }
+    
 }
 
-void xz_button_init(void)
+void xz_mqtt_button_init(void)
 {
     static int initialized = 0;
 
     if (initialized == 0)
     {
         button_cfg_t cfg;
-        cfg.pin = BSP_KEY2_PIN;
+        cfg.pin = BSP_KEY1_PIN;
 
-        cfg.active_state = BSP_KEY2_ACTIVE_HIGH;
+        cfg.active_state = BSP_KEY1_ACTIVE_HIGH;
         cfg.mode = PIN_MODE_INPUT;
         cfg.button_handler = xz_button_event_handler;
         int32_t id = button_init(&cfg);
@@ -411,11 +434,11 @@ void xz_audio_init()
 {
     rt_kprintf("xz_audio_init\n");
     rt_kprintf("exit sniff mode\n");
-    bt_interface_exit_sniff_mode(
-        (unsigned char *)&g_bt_app_env.bd_addr); // exit sniff mode
-    bt_interface_wr_link_policy_setting(
-        (unsigned char *)&g_bt_app_env.bd_addr,
-        BT_NOTIFY_LINK_POLICY_ROLE_SWITCH); // close role switch
+    // bt_interface_exit_sniff_mode(
+    //     (unsigned char *)&g_bt_app_env.bd_addr); // exit sniff mode
+    // bt_interface_wr_link_policy_setting(
+    //     (unsigned char *)&g_bt_app_env.bd_addr,
+    //     BT_NOTIFY_LINK_POLICY_ROLE_SWITCH); // close role switch
     if (udp_pcb)
     {
         udp_remove(udp_pcb);
@@ -424,7 +447,7 @@ void xz_audio_init()
     audio_server_set_private_volume(AUDIO_TYPE_LOCAL_MUSIC, 6);
     xz_audio_decoder_encoder_open(0);
 
-    xz_button_init();
+    xz_mqtt_button_init();
     udp_pcb = udp_new();
     g_xz_context.local_sequence = 0;
     g_xz_context.remote_sequence = 0;
@@ -550,11 +573,13 @@ static void xz_opus_thread_entry(void *p)
             if (res != XZ_SPK_FRAME_LEN / 2)
             {
                 LOG_I("decode out samples=%d\n", res);
-                RT_ASSERT(0);
+                //RT_ASSERT(0);
             }
-
-            audio_write_and_wait(thiz, (uint8_t *)thiz->downlink_decode_out,
-                                 XZ_SPK_FRAME_LEN);
+            if(res > 0)
+            {
+                audio_write_and_wait(thiz, (uint8_t *)thiz->downlink_decode_out,
+                                 res * 2);
+            }
 
             uint8_t need_decode_gain = 0;
             rt_enter_critical();

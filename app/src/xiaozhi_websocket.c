@@ -13,8 +13,8 @@
 #include "lwip/apps/websocket_client.h"
 #include "lwip/apps/mqtt_priv.h"
 #include "lwip/apps/mqtt.h"
-#include "xiaozhi.h"
-#include "xiaozhi2.h"
+#include "xiaozhi_mqtt.h"
+#include "xiaozhi_websocket.h"
 #include "bf0_hal.h"
 #include "bts2_global.h"
 #include "bts2_app_pan.h"
@@ -32,33 +32,30 @@
 #include "lv_obj.h"
 #include "lv_label.h"
 #include "lib_et_asr.h"
-#include "xiaozhi_weather.h"
+#include "../weather/weather.h"
 #ifdef BSP_USING_PM
     #include "gui_app_pm.h"
 #endif // BSP_USING_PM
-#include "xiaozhi_public.h"
-#define MAX_WSOCK_HDR_LEN 4096
-extern void xiaozhi_ui_update_ble(char *string);
-extern void xiaozhi_ui_chat_status(char *string);
-extern void xiaozhi_ui_chat_output(char *string);
-extern void xiaozhi_ui_update_emoji(char *string);
-extern void xiaozhi_ui_tts_output(char *string);
-extern void xiaozhi_ui_standby_chat_output(char *string);
-extern void ui_swith_to_xiaozhi_screen(void);
-extern void ui_swith_to_standby_screen(void);
-extern void xiaozhi_ui_update_standby_emoji(char *string);
-#define WEBSOC_RECONNECT 4
-// IoT 模块相关
-extern void iot_initialize();                              // 初始化 IoT 模块
-extern void iot_invoke(const uint8_t *data, uint16_t len); // 执行远程命令
-extern const char *iot_get_descriptors_json();             // 获取设备描述
-extern const char *iot_get_states_json();                  // 获取设备状态
+#include "xiaozhi_client_public.h"
+#include "xiaozhi_ui.h"
+#include "xiaozhi_audio.h"
 
-extern void xz_mic_open(xz_audio_t *thiz);
+#define MAX_WSOCK_HDR_LEN 4096
+#define WEBSOC_RECONNECT 4
+
+extern BOOL g_pan_connected;
+extern xz_audio_t *thiz;
+extern rt_mailbox_t g_bt_app_mb;
+extern lv_obj_t *main_container;
+extern lv_obj_t *standby_screen;
+extern uint8_t Initiate_disconnection_flag;
+extern rt_mailbox_t g_ui_task_mb;
+extern rt_tick_t last_listen_tick;
+extern void pan_reconnect();
+
 
 xiaozhi_ws_t g_xz_ws;
 rt_mailbox_t g_button_event_mb;
-
 enum DeviceState web_g_state;
 
 #if defined(__CC_ARM) || defined(__CLANG_ARM)
@@ -68,11 +65,7 @@ L2_RET_BSS_SECT_END
 #else
 static char message[256] L2_RET_BSS_SECT(message);
 #endif
-
-extern BOOL g_pan_connected;
-extern xz_audio_t *thiz;
 static const char *mode_str[] = {"auto", "manual", "realtime"};
-
 static const char *hello_message =
     "{"
     "\"type\":\"hello\","
@@ -85,6 +78,12 @@ static const char *hello_message =
     "\"format\":\"opus\", \"sample_rate\":16000, \"channels\":1, "
     "\"frame_duration\":60"
     "}}";
+
+// 倒计时动画
+static lv_obj_t *countdown_screen = NULL;
+static rt_thread_t countdown_thread = RT_NULL;
+static bool  g_ota_verified = false;
+uint8_t shutdown_state = 1; 
 
 typedef struct
 {
@@ -101,6 +100,7 @@ typedef struct
 
 static activation_context_t g_activation_context;
 static websocket_context_t g_websocket_context;
+
 
 void parse_helLo(const u8_t *data, u16_t len);
 
@@ -298,16 +298,12 @@ err_t my_wsapp_fn(int code, char *buf, size_t len)
 }
 void xiaozhi2(int argc, char **argv);
 
-extern rt_mailbox_t g_bt_app_mb;
-extern lv_obj_t *main_container;
-extern lv_obj_t *standby_screen;
-
 static void xz_button_event_handler(int32_t pin, button_action_t action)
 {
-    rt_kprintf("in button handle\n");
+    rt_kprintf("in ws button handle\n");
     lv_display_trigger_activity(NULL);
     gui_pm_fsm(GUI_PM_ACTION_WAKEUP); // 唤醒设备
-     rt_kprintf("in button handle2\n");
+     rt_kprintf("in ws button handle2\n");
     // 如果当前处于KWS模式，则退出KWS模式
         if (g_kws_running) 
         {  
@@ -326,7 +322,7 @@ static void xz_button_event_handler(int32_t pin, button_action_t action)
         rt_kprintf("按键->对话");
         if (now_screen == standby_screen)
         {
-            ui_swith_to_xiaozhi_screen();
+            ui_switch_to_xiaozhi_screen();
         }
     
         // 1. 检查是否处于睡眠状态（WebSocket未连接）
@@ -356,11 +352,10 @@ static void xz_button_event_handler(int32_t pin, button_action_t action)
         }
     }
 }
-#if PKG_XIAOZHI_USING_AEC
-extern uint8_t Initiate_disconnection_flag;
+#ifndef XIAOZHI_USING_MQTT
 void simulate_button_pressed()
 {
-    rt_kprintf("simulate_button_pressed pressed\r\n");
+    rt_kprintf("ws simulate_button_pressed pressed\r\n");
     if(Initiate_disconnection_flag)//蓝牙主动断开不允许mic触发
     {
         rt_kprintf("Initiate_disconnection_flag\r\n");
@@ -370,7 +365,7 @@ void simulate_button_pressed()
 }
 void simulate_button_released()
 {
-    rt_kprintf("simulate_button_released released\r\n");
+    rt_kprintf("ws simulate_button_released released\r\n");
     if(Initiate_disconnection_flag)
     {
         return;
@@ -379,10 +374,6 @@ void simulate_button_released()
 }
 #endif
 
-// 倒计时动画
-static lv_obj_t *countdown_screen = NULL;
-static rt_thread_t countdown_thread = RT_NULL;
-extern rt_mailbox_t g_ui_task_mb;
 static void xz_button2_event_handler(int32_t pin, button_action_t action)
 {
     if (action == BUTTON_PRESSED)
@@ -402,10 +393,13 @@ static void xz_button2_event_handler(int32_t pin, button_action_t action)
 
             // 长按3秒，直接发送关机消息到ui_task
         lv_obj_t *now_screen = lv_screen_active();
-        if (now_screen != standby_screen)
+        if (now_screen != standby_screen && g_activation_context.sem != RT_NULL)
         {
             rt_sem_release(g_activation_context.sem);
         }
+        shutdown_state = 0;
+        gui_pm_fsm(GUI_PM_ACTION_WAKEUP); // 唤醒设备
+        rt_thread_mdelay(100);
         rt_mb_send(g_ui_task_mb, UI_EVENT_SHUTDOWN);
     }
 
@@ -415,9 +409,10 @@ static void xz_button2_event_handler(int32_t pin, button_action_t action)
     }
 }
 
-void xz_button_init(void) // Session key
+void xz_ws_button_init(void) // Session key
 {
     static int initialized = 0;
+    rt_kprintf("xz_ws_button_init\n");
     if (initialized == 0)
     {
         // 按键1（对话+唤醒）
@@ -429,7 +424,15 @@ void xz_button_init(void) // Session key
         int32_t id1 = button_init(&cfg1);
         RT_ASSERT(id1 >= 0);
         RT_ASSERT(SF_EOK == button_enable(id1));
-
+        initialized = 1;
+    }
+}
+void xz_ws_button_init2(void)
+{
+    static int initialized = 0;
+    rt_kprintf("xz_ws_button2_init\n");
+    if (initialized == 0)
+    {
         // 按键2（关机）
         button_cfg_t cfg2;
         cfg2.pin = BSP_KEY2_PIN;
@@ -449,7 +452,6 @@ void xz_ws_audio_init()
     xz_audio_decoder_encoder_open(1); // 打开音频解码器和编码器
 
 }
-extern rt_tick_t last_listen_tick;
 void parse_helLo(const u8_t *data, u16_t len)
 {
     cJSON *item = NULL;
@@ -494,7 +496,7 @@ void parse_helLo(const u8_t *data, u16_t len)
         xiaozhi_ui_update_emoji("neutral");
         xiaozhi_ui_update_standby_emoji("funny");
         rt_kprintf("hello->对话\n");
-        ui_swith_to_xiaozhi_screen();//切换到小智对话界面
+        ui_switch_to_xiaozhi_screen();//切换到小智对话界面
 #ifdef PKG_XIAOZHI_USING_AEC
         ws_send_listen_start(&g_xz_ws.clnt, g_xz_ws.session_id, kListeningModeAlwaysOn);
 #endif
@@ -770,9 +772,7 @@ static void parse_ota_response(const char *response,
 
     cJSON_Delete(root);
 }
-extern void pan_reconnect();
 
-static bool  g_ota_verified = false;
 void xiaozhi2(int argc, char **argv)
 {
     g_activation_context.sem =

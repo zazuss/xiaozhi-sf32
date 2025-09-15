@@ -1,5 +1,5 @@
-#ifndef XIAOZHI2_H
-#define XIAOZHI2_H
+#ifndef XIAOZHI_WEBSOCKET_H
+#define XIAOZHI_WEBSOCKET_H
 
 #ifdef __cplusplus
 extern "C"
@@ -12,12 +12,21 @@ extern "C"
 #include "lwip/apps/websocket_client.h"
 #include "lwip/apps/mqtt_priv.h"
 #include "lwip/apps/mqtt.h"
-#include "xiaozhi.h"
+#include "xiaozhi_mqtt.h"
 #include "bf0_hal.h"
 #include "bts2_app_pan.h"
 #include <cJSON.h>
 #include "button.h"
 #include "audio_server.h"
+
+void xiaozhi2(int argc, char **argv);
+void xz_ws_button_init(void); // 对话键
+void xz_ws_button_init2(void);//关机键
+void xz_ws_audio_init(void);
+void xz_audio_send_using_websocket(uint8_t *data, int len); // 发送音频数据
+void ws_send_speak_abort(void *ws, char *session_id, int reason);
+void ws_send_listen_start(void *ws, char *session_id,enum ListeningMode mode);
+void ws_send_listen_stop(void *ws, char *session_id);
     /**
      * @brief xiaozhi websocket cntext 数据结构体
      */
@@ -42,4 +51,4 @@ extern "C"
 }
 #endif
 
-#endif // XIAOZHI2_H
+#endif // XIAOZHI_WEBSOCKET_H

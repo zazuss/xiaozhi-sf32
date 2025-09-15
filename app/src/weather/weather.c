@@ -6,7 +6,7 @@
 
 #include "rtthread.h"
 #include "rtdevice.h"
-#include "xiaozhi_public.h"
+#include "xiaozhi_client_public.h"
 #include "lwip/api.h"
 #include "lwip/dns.h"
 #include <webclient.h>
@@ -14,8 +14,10 @@
 #include "ulog.h"
 #include "bts2_app_inc.h"
 #include "ntp.h"
-#include "xiaozhi_weather.h"
+#include "weather.h"
 #include "littlevgl2rtt.h"
+#include <stdlib.h>
+#include <stdio.h>
 #include "lv_image_dsc.h"
 
 static volatile int g_weather_sync_in_progress = 0;  // 天气同步进行标志
@@ -816,10 +818,6 @@ int xiaozhi_ntp_sync(void)
     // 设置同步进行标志
     g_ntp_sync_in_progress = 1;
 
-    // 确保时区设置在同步时也生效
-    setenv("TZ", "Asia/Shanghai", 1);
-    tzset();
-
     if (!g_pan_connected)
     {
         LOG_W("PAN not connected, cannot sync time");
@@ -838,7 +836,6 @@ int xiaozhi_ntp_sync(void)
         rt_kprintf("Trying NTP server: %s\n", ntp_servers[i]);
 
 #ifdef PKG_USING_NETUTILS
-        extern time_t ntp_sync_to_rtc(const char *host_name);
         // 获取服务时间并设置rtc时间
         cur_time = ntp_sync_to_rtc(ntp_servers[i]);
         if (cur_time > 1000000000)// 基本的时间有效性检查（大约是2001年之后）
